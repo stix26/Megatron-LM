@@ -3,6 +3,7 @@
 from copy import deepcopy
 from functools import partial
 import warnings
+import yaml
 
 import torch
 
@@ -49,11 +50,19 @@ def model_provider(
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
     """
     args = get_args()
-    vision_model_type = "clip"
+    config_path = getattr(get_args(), "vision_config", "configs/vit_config.yaml")
+    with open(config_path, "r", encoding="utf-8") as f:
+        vit_cfg = yaml.safe_load(f)
+
+    vision_model_type = vit_cfg.get("vision_model_type", "clip")
 
     assert args.ckpt_format == 'torch', "Only ckpt-format torch is supported for VLM training currently."
     assert not (args.context_parallel_size > 1 and args.pipeline_model_parallel_size > 1), "PP+CP is not yet supported by this script. \
     Current mock dataset does not support natively packed sequence dataset required for correct PP comm shapes."
+
+    args.img_h = vit_cfg.get("img_h", args.img_h)
+    args.img_w = vit_cfg.get("img_w", args.img_w)
+    args.patch_dim = vit_cfg.get("patch_dim", args.patch_dim)
 
     num_image_embeddings = get_num_image_embeddings(
         args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token,
@@ -120,28 +129,27 @@ def model_provider(
     else:  # transformer_impl == "local"
         vision_transformer_layer_spec = get_vit_layer_with_local_spec()
 
-    # TODO: Make these configurable via input .yaml config.
     vision_transformer_config = deepcopy(language_transformer_config)
-    vision_transformer_config.num_layers = args.encoder_num_layers
+    vision_transformer_config.num_layers = vit_cfg.get("num_layers", args.encoder_num_layers)
     vision_transformer_config.first_pipeline_num_layers = None
     vision_transformer_config.last_pipeline_num_layers = None
     vision_transformer_config.vision_model_type = vision_model_type
-    vision_transformer_config.context_parallel_size = 1 # Force CP=1 for Vision Transformer
-    if vision_transformer_config.sequence_parallel:
-        print_rank_0("> Disabling Sequence parallelism in Vision Transformer. Not yet supported")
+    vision_transformer_config.context_parallel_size = vit_cfg.get("context_parallel_size", 1)
+    if vision_transformer_config.sequence_parallel and not vit_cfg.get("sequence_parallel", False):
+        print_rank_0("> Disabling Sequence parallelism in Vision Transformer as per config")
         vision_transformer_config.sequence_parallel = False
-    if vision_transformer_config.tp_comm_overlap:
-        print_rank_0("> Disabling TP Comm overlap in Vision Transformer. Not yet supported")
+    if vision_transformer_config.tp_comm_overlap and not vit_cfg.get("tp_comm_overlap", False):
+        print_rank_0("> Disabling TP Comm overlap in Vision Transformer as per config")
         vision_transformer_config.tp_comm_overlap = False
 
-    vision_projection_type = "mlp"
+    vision_projection_type = vit_cfg.get("projection_type", "mlp")
     vision_projection_config = deepcopy(language_transformer_config)
-    vision_projection_config.context_parallel_size = 1 # Force CP=1 for Vision Projection
-    if vision_projection_config.sequence_parallel:
-        print_rank_0("> Disabling Sequence parallelism in Vision Projection. Not yet supported")
+    vision_projection_config.context_parallel_size = vit_cfg.get("context_parallel_size", 1)
+    if vision_projection_config.sequence_parallel and not vit_cfg.get("sequence_parallel", False):
+        print_rank_0("> Disabling Sequence parallelism in Vision Projection as per config")
         vision_projection_config.sequence_parallel = False
-    if vision_projection_config.tp_comm_overlap:
-        print_rank_0("> Disabling TP Comm overlap in Vision Projection. Not yet supported")
+    if vision_projection_config.tp_comm_overlap and not vit_cfg.get("tp_comm_overlap", False):
+        print_rank_0("> Disabling TP Comm overlap in Vision Projection as per config")
         vision_projection_config.tp_comm_overlap = False
 
     if args.encoder_pipeline_model_parallel_size > 0:
@@ -166,7 +174,6 @@ def model_provider(
         vision_transformer_config.pipeline_model_parallel_size = 1
         vision_projection_config.pipeline_model_parallel_size = 1
 
-
     vision_projection_modules = deepcopy(language_transformer_layer_spec.submodules.mlp.submodules)
 
     language_max_sequence_length = args.decoder_seq_length
@@ -190,13 +197,13 @@ def model_provider(
         language_rotary_percent=args.rotary_percent,
         language_rope_scaling=args.use_rope_scaling,
         pre_process=(
-            parallel_state.is_pipeline_first_stage() or 
+            parallel_state.is_pipeline_first_stage() or
             parallel_state.get_pipeline_model_parallel_rank() == args.encoder_pipeline_model_parallel_size
         ),
         post_process=parallel_state.is_pipeline_last_stage(),
         add_encoder=parallel_state.is_pipeline_first_stage(),
         add_decoder=(
-            parallel_state.is_pipeline_last_stage() or 
+            parallel_state.is_pipeline_last_stage() or
             parallel_state.get_pipeline_model_parallel_rank() >= args.encoder_pipeline_model_parallel_size
         ),
         img_h=args.img_h,
@@ -299,6 +306,8 @@ def get_batch(data_iterator):
     """
     args = get_args()
     cp_size = args.context_parallel_size
+    with open(args.vision_config, "r", encoding="utf-8") as f:
+        vit_cfg = yaml.safe_load(f)
     # Broadcast data.
     if data_iterator is not None:
         data = next(data_iterator)
@@ -308,7 +317,6 @@ def get_batch(data_iterator):
     data_i = tensor_parallel.broadcast_data(["tokens", "position_ids", "labels"], data, torch.int64)
     data_f = tensor_parallel.broadcast_data(["image", "loss_mask"], data, torch.float32)
 
-    batch = dict()
     packed_seq_params = None
     image_token_mask = None
     # Create batch with tokens and position_ids for CP sharding.
@@ -319,11 +327,16 @@ def get_batch(data_iterator):
     images = data_f["image"].float()
 
     if cp_size > 1 or args.sequence_parallel:
-        vision_model_type = "clip"
+        vision_model_type = vit_cfg.get("vision_model_type", "clip")
         # Calculate the number of image embedding tokens will be added to text tokens
         num_image_embeddings_per_tile = get_num_image_embeddings(
-            args.img_h, args.img_w, args.patch_dim, vision_model_type,
-            args.disable_vision_class_token, 1, False
+            args.img_h,
+            args.img_w,
+            args.patch_dim,
+            vision_model_type,
+            args.disable_vision_class_token,
+            1,
+            False,
         )
         # Pad to make sure the text sequence can be sharded equally by CP chunks.
         image_token_mask = tokens == DEFAULT_IMAGE_TOKEN_INDEX
@@ -404,14 +417,26 @@ def add_vlm_extra_args(parser):
         help="Drop vision model class token",
     )
     group.add_argument("--dataloader-seq-length", type=int, help="Make dataloader to produce sequences of specific length.")
-    group.add_argument("--decoder-tp-comm-overlap", action="store_true", default=False, help="Enables the overlap of "
-                        "Tensor parallel communication and GEMM kernels in Decoder only. "
-                        "Please provide decoder-seq-length when using this feature.")
+    group.add_argument(
+        "--decoder-tp-comm-overlap",
+        action="store_true",
+        default=False,
+        help=(
+            "Enables the overlap of Tensor parallel communication and GEMM kernels in Decoder only. "
+            "Please provide decoder-seq-length when using this feature."
+        ),
+    )
     group.add_argument(
         "--use-packed-sequence",
         action="store_true",
         default=False,
         help="Use packed sequence",
+    )
+    group.add_argument(
+        "--vision-config",
+        type=str,
+        default="configs/vit_config.yaml",
+        help="Path to YAML file with vision transformer parameters",
     )
     return parser
 
