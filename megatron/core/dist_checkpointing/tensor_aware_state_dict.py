@@ -3,7 +3,7 @@
 """ Utilities for transforming state_dict, including a tensor-aware implementation."""
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
@@ -46,6 +46,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
     common: StateDict
     sharded_state_dict: ShardedStateDict
     _is_hollow: bool = False
+    _device_map: Dict[int, str] = field(default_factory=dict)
 
     @staticmethod
     def _validate_params(algo):
@@ -63,13 +64,13 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                 distribution = determine_main_replica_uniform_distribution(
                     sharded_part, parallelization_group, True
                 )
-                logger.debug(f'MCore_TASD._get_distribution calculated distribution')
+                logger.debug('MCore_TASD._get_distribution calculated distribution')
             else:
                 distribution = cached_distribution
-                logger.debug(f'MCore_TASD._get_distribution used cache')
+                logger.debug('MCore_TASD._get_distribution used cache')
         else:
             distribution = (None, None, None, None)
-            logger.debug(f'MCore_TASD._get_distribution returned empty distribution')
+            logger.debug('MCore_TASD._get_distribution returned empty distribution')
         return distribution
 
     @staticmethod
@@ -145,13 +146,12 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
     def _sharded_tensors(self):
         # Three possible states for sharded_tensor:
         # 1. sharded_tensor with data (.data = tensor)
-        # 2. sharded_tensor hollow (.data = None, .orig_device = orig_device)
+        # 2. sharded_tensor hollow (.data = None, device info in _device_map)
         # 3. removed sharded_tensor (.data = None, no device information)
         # TODO: Consider simplifying by removing the entire sharded_tensor instead of just the data
         if self.is_hollow:
             for sh_base in nested_values(self.sharded_state_dict):
-                # FIXME: Hacky way to store the original device of the popped tensor
-                if isinstance(sh_base, ShardedTensor) and hasattr(sh_base, 'orig_device'):
+                if isinstance(sh_base, ShardedTensor) and id(sh_base) in self._device_map:
                     yield sh_base
         else:
             for sh_base in nested_values(self.sharded_state_dict):
@@ -187,8 +187,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         result = []
         for sh_ten in self._sharded_tensors:
             result.append(sh_ten.data)
-            # FIXME: Hacky way to store the original device, which is not included in the metadata
-            setattr(sh_ten, 'orig_device', sh_ten.data.device.type)
+            # Record original device for later restoration
+            self._device_map[id(sh_ten)] = sh_ten.data.device.type
             sh_ten.data = None
         self._is_hollow = True
         return result
@@ -203,9 +203,9 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         """
         assert self.is_hollow  # TODO raise exception
         for sh_ten, ten in zip_strict(self._sharded_tensors, tensor_data):
-            # FIXME: Hacky way to store the original device
-            if sh_ten.orig_device == ten.device.type:
-                delattr(sh_ten, 'orig_device')
+            orig = self._device_map.pop(id(sh_ten), None)
+            if orig == ten.device.type:
+                pass
             # Tensor might be on non-original device
             sh_ten.data = ten
         self._is_hollow = False
@@ -220,9 +220,9 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         """
         assert self.is_hollow  # TODO raise exception
         for sh_ten in self._sharded_tensors:
-            # Hacky way to retrieve the original device
-            sh_ten.init_data(sh_ten.orig_device)
-            delattr(sh_ten, 'orig_device')
+            orig = self._device_map.get(id(sh_ten), 'cpu')
+            sh_ten.init_data(orig)
+            self._device_map.pop(id(sh_ten), None)
         self._is_hollow = False
 
     def copy_tensors_to_cpu(self, non_blocking=False):
@@ -236,12 +236,11 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         for sh_ten in self._sharded_tensors:
             if sh_ten.data.device.type == 'cpu':
                 # Skip cloning if it's already confirmed to be a copy
-                if not hasattr(sh_ten, 'orig_device'):
+                if id(sh_ten) not in self._device_map:
                     sh_ten.data = sh_ten.data.clone()
             else:
-                # FIXME: Hacky way to store the original device
-                if not hasattr(sh_ten, 'orig_device'):
-                    setattr(sh_ten, 'orig_device', sh_ten.data.device.type)
+                if id(sh_ten) not in self._device_map:
+                    self._device_map[id(sh_ten)] = sh_ten.data.device.type
                 sh_ten.data = sh_ten.data.detach().to("cpu", non_blocking=non_blocking)
 
     def restore_tensor_device(self, non_blocking=True):
@@ -251,10 +250,9 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         """
         assert not self.is_hollow  # TODO raise exception
         for sh_ten in self._sharded_tensors:
-            # FIXME: Hacky way to store the original device
-            if hasattr(sh_ten, 'orig_device'):
-                sh_ten.data = sh_ten.data.to(sh_ten.orig_device, non_blocking=non_blocking)
-                delattr(sh_ten, 'orig_device')
+            orig = self._device_map.pop(id(sh_ten), None)
+            if orig:
+                sh_ten.data = sh_ten.data.to(orig, non_blocking=non_blocking)
 
     def _insert_sharded_data(
         self, fully_parallel, sharded_part, parallelization_group, exchange_algo

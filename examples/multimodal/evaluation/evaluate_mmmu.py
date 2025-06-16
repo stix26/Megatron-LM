@@ -16,7 +16,6 @@ from run_text_generation import get_output_path
 from config import EvaluationConfig
 
 
-
 def get_input_output_paths(input_path, task):
     """Get all input files and an output path for a merged file."""
     # Single input file.
@@ -48,7 +47,6 @@ def extract_answer(text):
 
     text = text.replace("Answer:", "Answer: ")
     return text  # Return the original string if no match is found
-
 
 
 def convert_to_mmmu_format(input_path):
@@ -104,7 +102,7 @@ def mmmu_eval(input_path, groundtruth_path):
     print(output.stderr)
     print(output.stdout)
 
-    m = re.search("'Overall': {'num': \d+, 'acc': (\d.\d+)}", output.stdout)
+    m = re.search(r"'Overall': {'num': \d+, 'acc': (\d.\d+)}", output.stdout)
 
     return float(m.group(1)) * 100.0
 

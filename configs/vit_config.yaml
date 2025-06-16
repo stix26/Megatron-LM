@@ -1,0 +1,9 @@
+vision_model_type: clip
+img_h: 224
+img_w: 224
+patch_dim: 16
+num_layers: 12
+projection_type: mlp
+context_parallel_size: 1
+sequence_parallel: false
+tp_comm_overlap: false
