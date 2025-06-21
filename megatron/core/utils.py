@@ -10,6 +10,7 @@ import math
 import operator
 import queue
 import socket
+import os
 import sys
 import threading
 import time
@@ -1517,7 +1518,7 @@ class StragglerDetector:
         """
         try:
             if self.rank == 0:
-                neth = "0.0.0.0"
+                neth = os.getenv("BIND_ADDRESS", "127.0.0.1")  # Default to localhost for security
                 netp = self.port
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
